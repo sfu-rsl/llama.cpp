@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <algorithm>
 #include <vector>
 
@@ -27,6 +28,40 @@
 #include <sys/sysctl.h>
 #endif
 
+// DEFINING LOGGING FORMAT
+// Memory management log format:
+//   LOG_MESSAGE: (memory_management_nature; size + address_range; function_name; file_name; timestamp)
+// Nature codes:
+//   1 = allocating new memory       (real malloc/cudaMalloc — this file sees the buffer wrapper layer)
+//   2 = carving out from free block (slot cut out of existing slab)
+//   3 = freeing carved memory       (slot returned to free-block list, NOT a real free)
+//   4 = deallocation                (real free/cudaFree via buffer->iface.free_buffer)
+static void _mem_log_backend(int nature, size_t size, uintptr_t start, uintptr_t end,
+                              const char * func, const char * file) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    double ts_sec = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+
+    const char * nature_str;
+    switch (nature) {
+        case 1: nature_str = "1-allocating new memory";    break;
+        case 2: nature_str = "2-carving out from block";   break;
+        case 3: nature_str = "3-freeing carved memory";    break;
+        case 4: nature_str = "4-deallocation";             break;
+        default: nature_str = "unknown";                   break;
+    }
+
+    FILE * fp = fopen("ggml_mem_log.txt", "a");
+    if (fp) {
+        fprintf(fp,
+            "LOG_MESSAGE: (%s; size=%zu bytes [0x%zx - 0x%zx]; %s; %s; %.9f)\n",
+            nature_str, size, (size_t)start, (size_t)end, func, file, ts_sec);
+        fclose(fp);
+    }
+}
+#define MEM_LOG_B(nature, size, start_ptr) \
+    _mem_log_backend((nature), (size), (uintptr_t)(start_ptr), (uintptr_t)(start_ptr) + (size_t)(size), __func__, __FILE__)
+// END LOGGING FORMAT DEFINITION
 
 // backend buffer type
 
@@ -84,6 +119,7 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
 
 // backend buffer
 
+// LOGGING BY CLAUDE AGENT - checked 
 ggml_backend_buffer_t ggml_backend_buffer_init(
                ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i      iface,
@@ -97,6 +133,13 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
     };
 
+    // LOG: backend buffer wrapper created; the real cudaMalloc/malloc was already called
+    // by buft->iface.alloc_buffer before this init; size==0 means dummy/zero-sized buffer
+    if (size > 0) {
+        void * base = buffer->iface.get_base ? buffer->iface.get_base(buffer) : nullptr;
+        MEM_LOG_B(1, size, base);
+    }
+
     return buffer;
 }
 
@@ -104,9 +147,16 @@ const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer));
 }
 
+// LOGGING BY CLAUDE AGENT - checked
 void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     if (buffer == NULL) {
         return;
+    }
+
+    // LOG: real deallocation — iface.free_buffer calls cudaFree (GPU) or free (CPU)
+    if (buffer->size > 0 && buffer->iface.free_buffer != NULL) {
+        void * base = buffer->iface.get_base ? buffer->iface.get_base(buffer) : nullptr;
+        MEM_LOG_B(4, buffer->size, base);
     }
 
     if (buffer->iface.free_buffer != NULL) {
