@@ -1,5 +1,5 @@
 #include "llama-kv-cache.h"
-
+#include "kv_cache_logger.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -281,6 +281,8 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
+    KV_LOG_INIT(kv_size, hparams.n_layer, n_stream, type_k, type_v, offload);
+
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
     const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
     if (attn_rot_disable) {
@@ -322,12 +324,15 @@ llama_kv_cache::llama_kv_cache(
             ggml_gen_hadamard(tmp);
         }
     }
+    
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
 void llama_kv_cache::clear(bool data) {
+    KV_LOG_CLEAR_FULL(data, n_stream);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -355,6 +360,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        const uint32_t _used_before = cells.get_used();
+
         uint32_t new_head = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -369,6 +376,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
         }
 
+        KV_LOG_SEQ_RM(seq_id, p0, p1, _used_before - cells.get_used());
+
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
@@ -378,6 +387,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         for (uint32_t s = 0; s < n_stream; ++s) {
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
+
+            const uint32_t _used_before_any = cells.get_used();
 
             uint32_t new_head = cells.size();
 
@@ -392,6 +403,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     new_head = i;
                 }
             }
+
+            KV_LOG_SEQ_RM(-1, p0, p1, _used_before_any - cells.get_used());
 
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
@@ -496,6 +509,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
 
+    const uint32_t _keep_used_before = cells.get_used();
+
     uint32_t new_head = cells.size();
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -505,6 +520,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
             }
         }
     }
+
+    KV_LOG_SEQ_KEEP(seq_id, _keep_used_before - cells.get_used());
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
@@ -1022,6 +1039,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         seq_pos_max_rm[s] = -1;
     }
 
+    // KV lifecycle log: one record per micro-batch
+    {
+        const uint32_t _head_before = sinfo.n_stream() > 0 ? v_heads[sinfo.strm[0]] : 0;
+        KV_LOG_BATCH_FILL(sinfo, ubatch.n_tokens, _head_before);
+    }
+
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1044,6 +1067,16 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
+
+            // KV lifecycle log: one record per token slot written
+            {
+                std::vector<llama_seq_id> _log_sids;
+                _log_sids.reserve(ubatch.n_seq_id[i]);
+                for (int32_t _ls = 0; _ls < ubatch.n_seq_id[i]; ++_ls) {
+                    _log_sids.push_back(ubatch.seq_id[i][_ls]);
+                }
+                KV_LOG_FILL(sinfo.strm[s], idx, ubatch.pos[i], _log_sids, ubatch.n_tokens, 0u);
+            }
 
             if (ubatch.is_pos_2d()) {
                 llama_kv_cell_ext ext {
