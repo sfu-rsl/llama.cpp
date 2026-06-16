@@ -514,6 +514,8 @@ llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
+
+        // MMAP
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,
@@ -541,8 +543,11 @@ llama_model_loader::llama_model_loader(
             /*.no_alloc = */ true,
             /*.ctx      = */ &ctx,
         };
-
+        // 415 Edits:
+        // print("opens the file and reads only the header and metadata key values")
+        // print("don't allocate anything for tensor data yet, just read the index when no_alloc = true")
         metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
+
         metadata = metadata_ptr.get();
         if (metadata == nullptr) {
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
@@ -1159,8 +1164,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+
+                        LLAMA_LOG_INFO("%s: Weights: For each tensor, picking the right backend buffer type. \n", __func__);
+
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+
+                        // MMAP
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1330,6 +1340,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+// MMAP
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     if (use_mmap) {
         mappings.reserve(files.size());
@@ -1346,6 +1357,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
+            // 415 EDITS
+            // print("For each GGUF file (models can be split across multiple files), it creates a mapping object.")
+            // print("The virtual address space is assigned here — but zero physical RAM is committed")
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
@@ -1533,12 +1547,18 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
+
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
                 buf_mmap = bufs.at(weight->idx);
             }
+
+            // 415 EDITS
+            // print("The tensor's data pointer is set directly to mapping->addr() + offset.")
+            // print("No copy. The tensor just points into the mmap region. When the GPU needs ")
+            // print("the weights, they get copied from there")
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
@@ -1549,6 +1569,7 @@ bool llama_model_loader::load_all_data(
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
+                // 415 EDITS
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
@@ -1564,6 +1585,10 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
+            // 415 EDITS
+            // print("Explicitly seeks to the tensor's offset in the file and reads it into pre-allocated memory")
+            // print("This is a real copy — disk → RAM — all at load time, eagerly")
+            // print("GGML backend managed so freed in context?")
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
@@ -1666,13 +1691,22 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        // 415 EDITS
+        // print("After all tensors are loaded, it calls unmap_fragment() to release")
+        // print("the virtual address ranges that turned out to be unused")
+        // print("this is after GPU offloading")
+
         // unmap offloaded tensors and metadata
+
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
+
+                LLAMA_LOG_DEBUG("%s: offloading header + metadata + GPU tensor pages\n", __func__);
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {
+                    LLAMA_LOG_DEBUG("%s: offloading tail after last CPU tensor\n", __func__);
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
             }

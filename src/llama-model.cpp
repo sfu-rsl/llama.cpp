@@ -1468,6 +1468,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
+        // 415 EDITS
+        // ggml_backend_buffer_ptr is a unique_ptr with a custom deleter
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
@@ -1483,6 +1485,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+
+                // GPU gets a view into the same physical memory the OS mapped from disk
+                LLAMA_LOG_INFO("%s: Weights: Following the mmap path, where the mmap pages are regostered with the GPU driver. \n", __func__);
+                LLAMA_LOG_INFO("%s: Weights: addr+first is skip header and CPU tensors, last - first is the GPU slice. \n", __func__);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1498,6 +1504,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                LLAMA_LOG_INFO("%s: Weights: Following the no-mmap path, where the one big buffer is allocated for all tensors going to this backend. \n", __func__);
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
             }
             if (buf == nullptr) {
@@ -1556,6 +1563,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        LLAMA_LOG_INFO("%s: loads all the data by reading from disk and memcpy's into buf\n", __func__);
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
@@ -2161,6 +2169,7 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    LLAMA_LOG_INFO("%s: Weights: Destructor chain activated\n", __func__);
     delete model;
 }
 

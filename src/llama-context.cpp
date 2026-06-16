@@ -30,6 +30,7 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// 415 EDITS
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -241,6 +242,8 @@ llama_context::llama_context(
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
+
+            // 415 EDITS - gpu
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -252,6 +255,8 @@ llama_context::llama_context(
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+
+                // 415 EDITS - ACCEL/BAS
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend == nullptr) {
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
@@ -260,6 +265,7 @@ llama_context::llama_context(
             }
         }
 
+        // 415 EDITS
         // add CPU backend
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
@@ -281,6 +287,7 @@ llama_context::llama_context(
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
+        // 415 EDITS
         // graph outputs buffer
         {
             if (output_reserve(params.n_seq_max) < params.n_seq_max) {
@@ -302,6 +309,8 @@ llama_context::llama_context(
             /*.ctx_type= */ cparams.ctx_type,
         };
 
+        // 415 EDITS
+        // KV cache 
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
@@ -368,6 +377,8 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // 415 EDITS
+        // scratch buffers
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -431,6 +442,9 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
+    // 415 EDITS
+    // creates a new scheduler
+    LLAMA_LOG_INFO("%s: Scratch Buffers: Creates scheduler with no memory yet\n", __func__);
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
@@ -449,6 +463,7 @@ void llama_context::sched_reserve() {
 
     // resolve automatic Flash Attention use
     if (cparams.auto_fa) {
+        LLAMA_LOG_DEBUG("%s: Check if flash attention works on this hardware.\n", __func__);
         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
         if (!gf) {
             throw std::runtime_error("failed to reserve graph for Flash Attention check");
@@ -492,6 +507,7 @@ void llama_context::sched_reserve() {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 
         if (cparams.fused_gdn_ar) {
+            LLAMA_LOG_DEBUG("%s: Check if fused gated delta net work.\n", __func__);
             auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
             if (!gf) {
                 throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (autoregressive)");
@@ -533,6 +549,8 @@ void llama_context::sched_reserve() {
             // it with t_embd which is reduced to [n_outputs, ...] via out_ids. if n_outputs != n_tokens,
             // the ggml_mul_mat assertion fails. this matches the pp reservation below (line ~553).
             const uint32_t n_tokens_ch = 16*n_seqs;
+            LLAMA_LOG_DEBUG("%s: Check if fused gated delta net work (chunked).\n", __func__);
+
             auto * gf = graph_reserve(n_tokens_ch, n_seqs, n_tokens_ch, mctx.get(), true);
             if (!gf) {
                 throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (chunked)");
@@ -577,8 +595,14 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
+    // 415 EDITS
+    // three real reserve passes
+    // The TG pass might have caused the scratch to grow, so running PP again at the 
+    // end ensures the final scratch size can handle PP without ever needing to grow at runtime.
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
-    {
+    {   
+        LLAMA_LOG_INFO("%s: Scratch Buffers: Building the worst case prompt-preserving graph\n", __func__);
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
@@ -586,6 +610,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                
+                // 415 EDITS
+                // PP graph (prompt, many tokens)
                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
             }
             if (!gf) {
@@ -598,7 +625,8 @@ void llama_context::sched_reserve() {
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
-    {
+    {   
+        LLAMA_LOG_INFO("%s: Scratch Buffers: Building worst case token generation graph\n", __func__);
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
@@ -614,6 +642,8 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
+        LLAMA_LOG_INFO("%s: Scratch Buffers: Running PP graph to stabilize\n", __func__);
+
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1274,10 +1304,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         res->reset();
 
+        // 415 EDITS
+        // bump ptr reset
+        LLAMA_LOG_INFO("%s: Scratch Buffers: Rewinding pointers to start\n", __func__);
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
+
+        // 415 EDITS
+        // build compute graph
 
         gf = model.build_graph(gparams);
 
@@ -1288,6 +1324,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+
+        // 415 EDITS
+        // place tensors in scratch
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1701,6 +1740,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
     output_swaps.clear();
+
+    // 415 EDITS
+    // check if sched needs re-reserving
 
     sched_reserve();
 
