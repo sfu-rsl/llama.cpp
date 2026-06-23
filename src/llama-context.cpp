@@ -22,6 +22,20 @@
 // llama_context
 //
 
+static void log_rss(const char * label) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    long rss_kb = 0, vm_kb = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) sscanf(line, "VmRSS: %ld", &rss_kb);
+        if (strncmp(line, "VmSize:", 7) == 0) sscanf(line, "VmSize: %ld", &vm_kb);
+    }
+    fclose(f);
+    LLAMA_LOG_INFO("[MEMCHECK @ %s] RSS=%.1f MB  Virt=%.1f MB\n",
+        label, rss_kb / 1024.0f, vm_kb / 1024.0f);
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -379,8 +393,12 @@ llama_context::llama_context(
 
         // 415 EDITS
         // scratch buffers
-        sched_reserve();
 
+        // 415 MEMCHECK
+        log_rss("pre-scratch-alloc");   
+        sched_reserve();
+        log_rss("post-scratch-alloc"); 
+          
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");

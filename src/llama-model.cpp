@@ -34,6 +34,21 @@
 #include <string>
 #include <vector>
 
+
+static void log_rss(const char * label) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    long rss_kb = 0, vm_kb = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) sscanf(line, "VmRSS: %ld", &rss_kb);
+        if (strncmp(line, "VmSize:", 7) == 0) sscanf(line, "VmSize: %ld", &vm_kb);
+    }
+    fclose(f);
+    LLAMA_LOG_INFO("[MEMCHECK @ %s] RSS=%.1f MB  Virt=%.1f MB\n",
+        label, rss_kb / 1024.0f, vm_kb / 1024.0f);
+}
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1504,8 +1519,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+
                 LLAMA_LOG_INFO("%s: Weights: Following the no-mmap path, where the one big buffer is allocated for all tensors going to this backend. \n", __func__);
+                
+                // 415 MEMCHECK
+                log_rss("pre-buffer-alloc");                
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                log_rss("post-buffer-alloc");
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1562,6 +1582,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    // 415 MEMCHECK
+    log_rss("pre-load-all-data");    
+    
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         LLAMA_LOG_INFO("%s: loads all the data by reading from disk and memcpy's into buf\n", __func__);
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {

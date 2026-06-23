@@ -17,6 +17,20 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static void log_rss(const char * label) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    long rss_kb = 0, vm_kb = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) sscanf(line, "VmRSS: %ld", &rss_kb);
+        if (strncmp(line, "VmSize:", 7) == 0) sscanf(line, "VmSize: %ld", &vm_kb);
+    }
+    fclose(f);
+    LLAMA_LOG_INFO("[MEMCHECK @ %s] RSS=%.1f MB  Virt=%.1f MB\n",
+        label, rss_kb / 1024.0f, vm_kb / 1024.0f);
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -1531,8 +1545,10 @@ bool llama_model_loader::load_all_data(
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
             ggml_backend_name(upload_backend));
     }
-
+    size_t cumulative_loaded = 0;
+    size_t next_log_threshold = 512 * 1024 * 1024;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
@@ -1590,8 +1606,20 @@ bool llama_model_loader::load_all_data(
             // print("This is a real copy — disk → RAM — all at load time, eagerly")
             // print("GGML backend managed so freed in context?")
             if (ggml_backend_buffer_is_host(cur->buffer)) {
+
+                // 415 MEMCHECK
+                cumulative_loaded += n_size;
+                if (cumulative_loaded >= next_log_threshold) {
+                    next_log_threshold += 512 * 1024 * 1024;
+                    char label[64];
+                    snprintf(label, sizeof(label), "read-%.0fMB tensor=%s",
+                        cumulative_loaded / 1024.0f / 1024.0f, ggml_get_name(cur));
+                    log_rss(label);
+                }
+
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
